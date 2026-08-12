@@ -1,427 +1,607 @@
-# ============================================================================
-# DO-PM - Dolet Package Manager
-# Written in Pure Dolet!
-# ============================================================================
+# DOPM - deterministic, project-local package manager for Dolet.
+#
+# DOPM owns dependency acquisition and locking. Obin owns application builds;
+# doletc owns compilation. Installed sources live in .dopm/packages so projects
+# never mutate the compiler installation or each other.
 
-# External bindings
-extern lib "msvcrt":
-    fun system(command: str) -> i32
-    fun fopen(filename: str, mode: str) -> i64
-    fun fclose(file: i64) -> i32
-    fun fgets(buf: i64, size: i32, file: i64) -> i64
-    fun feof(file: i64) -> i32
+struct DopmRecord:
+    name: str = ""
+    source: str = ""
+    revision: str = ""
+    valid: i32 = 0
 
-extern lib "kernel32":
-    fun GetFileAttributesA(lpFileName: str) -> i32
-    fun GetCommandLineA() -> i64
-    fun GetModuleFileNameA(hModule: i64, lpFilename: i64, nSize: i32) -> i32
+fun dopm_version() -> str:
+    return "DOPM 0.3.0"
 
-# Get the directory where dopm.exe is located
-fun get_exe_dir() -> str:
-    buf: i64 = Memory.malloc(512)
-    len: i32 = GetModuleFileNameA(0, buf, 511)
-    
-    # Find last backslash to get directory
-    last_slash: i64 = -1
-    i: i64 = 0
-    while i < len as i64:
-        ch: i8 = Memory.read_i8(buf + i)
-        if ch == 92:  # backslash
-            last_slash = i
-        i = i + 1
-    
-    if last_slash > 0:
-        Memory.write_i8(buf + last_slash, 0)
-    
-    return buf as str
+fun dopm_safe_name(value: str) -> i32:
+    length: i64 = Memory.strlen(value)
+    if length == 0 or length > 128:
+        return 0
+    index: i64 = 0
+    while index < length:
+        ch: i32 = Memory.read_i8((value as i64) + index) as i32
+        # Portable canonical form: Windows paths are case-insensitive while
+        # Linux paths are not. Lowercase names prevent two lock entries from
+        # addressing the same directory on one host but not the other.
+        if not ((ch >= 48 and ch <= 57) or (ch >= 97 and ch <= 122) or ch == 45 or ch == 95):
+            return 0
+        index = index + 1
+    return 1
 
-# ============================================================================
-# Helper functions
-# ============================================================================
-fun path_exists(path: str) -> bool:
-    attrs: i32 = GetFileAttributesA(path)
-    return attrs != -1
+fun dopm_safe_source(value: str) -> i32:
+    # Lock records are line-oriented and use '|' as their field separator.
+    # Reject ambiguous input instead of writing a lock file that cannot be
+    # parsed deterministically on the next machine.
+    if Memory.strlen(value) == 0:
+        return 0
+    if Str.contains(value, "|") or Str.contains(value, "\n") or Str.contains(value, "\r"):
+        return 0
+    return 1
 
-fun trim_spaces(s: str) -> str:
-    start: i64 = s as i64
-    len: i64 = Memory.strlen(s)
-    
-    # Skip leading spaces
-    while len > 0:
-        ch: i8 = Memory.read_i8(start)
-        if ch != 32 and ch != 9:
-            break
-        start = start + 1
-        len = len - 1
-    
-    # Find end (skip trailing spaces and newlines)
-    end: i64 = start + len - 1
-    while end >= start:
-        ch: i8 = Memory.read_i8(end)
-        if ch != 32 and ch != 9 and ch != 10 and ch != 13:
-            break
-        end = end - 1
-    
-    new_len: i64 = end - start + 1
-    if new_len <= 0:
-        return ""
-    
-    buf: i64 = Memory.malloc(new_len + 1)
-    Memory.copy(buf, start, new_len)
-    Memory.write_i8(buf + new_len, 0)
-    return buf as str
+fun dopm_safe_revision(value: str) -> i32:
+    length: i64 = Memory.strlen(value)
+    if length == 0 or length > 256:
+        return 0
+    # Revisions are shell-quoted, but a leading '-' would still be parsed by
+    # Git as an option. Lock delimiters/control lines are invalid as well.
+    if Memory.read_i8(value as i64) == 45 as i8:
+        return 0
+    if Str.contains(value, "|") or Str.contains(value, "\n") or Str.contains(value, "\r"):
+        return 0
+    index: i64 = 0
+    while index < length:
+        ch: i32 = Memory.read_i8((value as i64) + index) as i32
+        if not ((ch >= 48 and ch <= 57) or (ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122) or ch == 45 or ch == 46 or ch == 47 or ch == 64 or ch == 95 or ch == 43):
+            return 0
+        index = index + 1
+    return 1
 
-fun get_repo_for(name: str) -> str:
-    # Try absolute path based on exe location first
-    exe_dir: str = get_exe_dir()
-    pkg_path: str = @"{exe_dir}\\packages.txt"
-    file: i64 = fopen(pkg_path, "r")
-    
-    if file == 0:
-        # Try relative paths as fallback
-        file = fopen("dopm/packages.txt", "r")
-    if file == 0:
-        file = fopen("packages.txt", "r")
-    if file == 0:
-        return ""
-    
-    buf: i64 = Memory.malloc(512)
-    name_len: i64 = Memory.strlen(name)
-    in_modules: bool = false
-    
-    while feof(file) == 0:
-        result: i64 = fgets(buf, 511, file)
-        if result == 0:
-            break
-        
-        line: str = buf as str
-        line_len: i64 = Memory.strlen(line)
-        first_ch: i8 = Memory.read_i8(buf)
-        
-        # Check for section headers
-        if first_ch == 91:  # '['
-            if line_len >= 9:
-                is_modules: bool = true
-                modules_str: str = "[modules]"
-                i: i64 = 0
-                while i < 9:
-                    c1: i8 = Memory.read_i8(buf + i)
-                    c2: i8 = Memory.read_i8((modules_str as i64) + i)
-                    if c1 != c2:
-                        is_modules = false
-                        break
-                    i = i + 1
-                
-                if is_modules:
-                    in_modules = true
-                else:
-                    in_modules = false
-            continue
-        
-        # Skip if not in [modules] section
-        if in_modules == false:
-            continue
-        
-        # Skip comments and empty lines
-        if first_ch == 35 or first_ch == 10 or first_ch == 13:
-            continue
-        
-        # Find the | separator
-        pos: i64 = 0
-        sep_pos: i64 = -1
-        
-        while pos < line_len:
-            ch: i8 = Memory.read_i8(buf + pos)
-            if ch == 124:  # |
-                sep_pos = pos
-                break
-            pos = pos + 1
-        
-        if sep_pos == -1:
-            continue
-        
-        # Extract package name
-        Memory.write_i8(buf + sep_pos, 0)
-        pkg_name: str = trim_spaces(buf as str)
-        
-        # Check if it matches
-        if Memory.strlen(pkg_name) == name_len:
-            is_match: bool = true
-            i: i64 = 0
-            while i < name_len:
-                c1: i8 = Memory.read_i8((pkg_name as i64) + i)
-                c2: i8 = Memory.read_i8((name as i64) + i)
-                if c1 != c2:
-                    is_match = false
-                    break
-                i = i + 1
-            
-            if is_match:
-                # Extract repo URL
-                repo: str = trim_spaces((buf + sep_pos + 1) as str)
-                fclose(file)
-                Memory.free(buf)
-                return repo
-    
-    fclose(file)
-    Memory.free(buf)
-    return ""
-
-# Parse command line and extract argument at index
-# Returns empty string if not found
-fun get_arg(index: i32) -> str:
-    cmdline: i64 = GetCommandLineA()
-    cmdline_str: str = cmdline as str
-    
-    # Skip spaces and find arguments
-    pos: i64 = 0
-    arg_count: i32 = 0
-    arg_start: i64 = 0
-    in_arg: bool = false
-    in_quotes: bool = false
-    
-    len: i64 = Memory.strlen(cmdline_str)
-    
-    while pos < len:
-        ch: i8 = Memory.read_i8(cmdline + pos)
-        
-        if ch == 34:  # Quote "
-            in_quotes = not in_quotes
-        else if ch == 32 and in_quotes == false:  # Space
-            if in_arg:
-                # End of argument
-                if arg_count == index:
-                    # Found our argument, extract it
-                    arg_len: i64 = pos - arg_start
-                    buf: i64 = Memory.malloc(arg_len + 1)
-                    Memory.copy(buf, cmdline + arg_start, arg_len)
-                    Memory.write_i8(buf + arg_len, 0)
-                    return buf as str
-                arg_count = arg_count + 1
-                in_arg = false
-        else:
-            if in_arg == false:
-                arg_start = pos
-                in_arg = true
-        
-        pos = pos + 1
-    
-    # Check last argument
-    if in_arg and arg_count == index:
-        arg_len: i64 = pos - arg_start
-        buf: i64 = Memory.malloc(arg_len + 1)
-        Memory.copy(buf, cmdline + arg_start, arg_len)
-        Memory.write_i8(buf + arg_len, 0)
-        return buf as str
-    
-    return ""
-
-fun str_eq(a: str, b: str) -> bool:
-    len_a: i64 = Memory.strlen(a)
-    len_b: i64 = Memory.strlen(b)
-    if len_a != len_b:
+fun dopm_is_source_spec(value: str) -> bool:
+    length: i64 = Memory.strlen(value)
+    if length == 0:
         return false
-    
-    i: i64 = 0
-    while i < len_a:
-        c1: i8 = Memory.read_i8((a as i64) + i)
-        c2: i8 = Memory.read_i8((b as i64) + i)
-        if c1 != c2:
-            return false
-        i = i + 1
-    return true
+    # URI, POSIX/relative path, Windows path, SCP-style Git URL, or a bare
+    # repository name ending in .git. Everything else is a revision selector.
+    if Str.contains(value, "://") or Str.starts_with(value, ".") or Str.starts_with(value, "/") or Str.contains(value, "\\") or PathOps.exists(value) == 1:
+        return true
+    if length >= 2 and Memory.read_i8((value as i64) + 1) as i32 == 58:
+        return true
+    if Str.contains(value, "@") and Str.contains(value, ":"):
+        return true
+    if Str.ends_with(value, ".git"):
+        return true
+    return false
 
-# ============================================================================
-# Package Manager
-# ============================================================================
-struct DOPM:
-    
-    fun install(self, pkg_name: str) -> bool:
-        print(@"[INFO] Installing: {pkg_name}")
-        
-        repo: str = get_repo_for(pkg_name)
-        if Memory.strlen(repo) == 0:
-            print("[ERROR] Package not found")
-            print("[INFO] Use 'dopm search' to see available packages")
-            return false
-        
-        # Get bootstrap directory (parent of dopm folder)
-        exe_dir: str = get_exe_dir()
-        target: str = @"{exe_dir}\\..\\tools\\dolet\\lib\\external-modules\\{pkg_name}"
-        
-        if path_exists(target):
-            print("[INFO] Already installed")
-            return true
-        
-        cmd: str = @"git clone {repo} \"{target}\""
-        print(@"[INFO] Running: {cmd}")
-        
-        result: i32 = system(cmd)
-        
-        if result == 0:
-            print("[OK] Installed!")
+fun dopm_quote_windows(value: str) -> str:
+    result: str = "\""
+    slash_count: i64 = 0
+    index: i64 = 0
+    length: i64 = Memory.strlen(value)
+    while index < length:
+        ch: i32 = Memory.read_i8((value as i64) + index) as i32
+        if ch == 92:
+            slash_count = slash_count + 1
+        elif ch == 34:
+            result = Str.concat(result, Str.repeat("\\", (slash_count * 2 + 1) as i32))
+            result = Str.concat(result, "\"")
+            slash_count = 0
         else:
-            print("[ERROR] Failed")
-        
-        return result == 0
-    
-    fun uninstall(self, pkg_name: str) -> bool:
-        print(@"[INFO] Removing: {pkg_name}")
-        
-        exe_dir: str = get_exe_dir()
-        target: str = @"{exe_dir}\\..\\tools\\dolet\\lib\\external-modules\\{pkg_name}"
-        
-        if path_exists(target) == false:
-            print("[ERROR] Not installed")
-            return false
-        
-        cmd: str = @"rmdir /s /q \"{target}\""
-        result: i32 = system(cmd)
-        
-        if result == 0:
-            print("[OK] Removed!")
-        else:
-            print("[ERROR] Failed")
-        
-        return result == 0
-    
-    fun show_list(self):
-        print("")
-        print("Installed packages:")
-        print("--------------------------------------------------")
-        exe_dir: str = get_exe_dir()
-        list_cmd: str = @"dir /b /ad \"{exe_dir}\\..\\tools\\dolet\\lib\\external-modules\""
-        system(list_cmd)
-        print("--------------------------------------------------")
-    
-    fun search(self):
-        print("")
-        print("Available packages:")
-        print("--------------------------------------------------")
-        
-        exe_dir: str = get_exe_dir()
-        pkg_path: str = @"{exe_dir}\\packages.txt"
-        file: i64 = fopen(pkg_path, "r")
-        if file == 0:
-            file = fopen("dopm/packages.txt", "r")
-        if file == 0:
-            file = fopen("packages.txt", "r")
-        if file == 0:
-            print("  (could not read packages.txt)")
-        else:
-            buf: i64 = Memory.malloc(512)
-            in_modules: bool = false
-            
-            while feof(file) == 0:
-                result: i64 = fgets(buf, 511, file)
-                if result == 0:
-                    break
-                
-                line_len: i64 = Memory.strlen(buf as str)
-                first_ch: i8 = Memory.read_i8(buf)
-                
-                # Check for [modules] section header
-                if first_ch == 91:  # '['
-                    # Check if it's [modules]
-                    if line_len >= 9:
-                        is_modules: bool = true
-                        modules_str: str = "[modules]"
-                        i: i64 = 0
-                        while i < 9:
-                            c1: i8 = Memory.read_i8(buf + i)
-                            c2: i8 = Memory.read_i8((modules_str as i64) + i)
-                            if c1 != c2:
-                                is_modules = false
-                                break
-                            i = i + 1
-                        
-                        if is_modules:
-                            in_modules = true
-                        else:
-                            in_modules = false
-                    continue
-                
-                # Skip if not in [modules] section
-                if in_modules == false:
-                    continue
-                
-                # Skip comments and empty lines
-                if first_ch == 35:
-                    continue
-                if first_ch == 10:
-                    continue
-                if first_ch == 13:
-                    continue
-                
-                # Find the | separator
-                pos: i64 = 0
-                has_sep: bool = false
-                while pos < line_len:
-                    ch: i8 = Memory.read_i8(buf + pos)
-                    if ch == 124:
-                        has_sep = true
-                        break
-                    pos = pos + 1
-                
-                if has_sep:
-                    # Remove newline at end
-                    end: i64 = line_len - 1
-                    while end >= 0:
-                        ch: i8 = Memory.read_i8(buf + end)
-                        if ch == 10 or ch == 13:
-                            Memory.write_i8(buf + end, 0)
-                        else:
-                            break
-                        end = end - 1
-                    
-                    # Print with prefix
-                    line_str: str = buf as str
-                    print(@"  {line_str}")
-            
-            Memory.free(buf)
-            fclose(file)
-        
-        print("--------------------------------------------------")
-    
-    fun show_help(self):
-        print("")
-        print("DOPM - Dolet Package Manager")
-        print("")
-        print("Usage:")
-        print("  dopm install <pkg>   Install a package")
-        print("  dopm remove <pkg>    Remove a package")
-        print("  dopm list            List installed packages")
-        print("  dopm search          Search packages")
-        print("")
+            if slash_count > 0:
+                result = Str.concat(result, Str.repeat("\\", slash_count as i32))
+                slash_count = 0
+            result = Str.concat(result, Str.substring(value, index, index + 1))
+        index = index + 1
+    if slash_count > 0:
+        result = Str.concat(result, Str.repeat("\\", (slash_count * 2) as i32))
+    return Str.concat(result, "\"")
 
-# ============================================================================
-# Main
-# ============================================================================
-pm: DOPM = DOPM{}
+fun dopm_quote(value: str) -> str:
+    if Str.equals(PlatformInfo.name(), "windows"):
+        return dopm_quote_windows(value)
+    # POSIX shell single-quote encoding: ' becomes '\''.
+    return Str.concat("'", Str.concat(Str.replace(value, "'", "'\\''"), "'"))
 
-# Get command: arg 1 (arg 0 is program name)
-cmd: str = get_arg(1)
-pkg: str = get_arg(2)
+fun dopm_read(path: str) -> str:
+    if PathOps.exists(path) == 0:
+        return ""
+    file: File = File.open_cwd(path, "r")
+    if file.is_valid() == false:
+        return ""
+    content: str = file.read_text()
+    file.close()
+    return content
 
-if Memory.strlen(cmd) == 0:
-    pm.show_help()
-    pm.search()
-else if str_eq(cmd, "install"):
-    if Memory.strlen(pkg) == 0:
-        print("[ERROR] Usage: dopm install <package>")
+fun dopm_write(path: str, content: str) -> i32:
+    file: File = File.open_cwd(path, "w")
+    if file.is_valid() == false:
+        return 0
+    written: i32 = file.write(content)
+    file.close()
+    if written < 0:
+        return 0
+    return 1
+
+fun dopm_ensure_directory(path: str) -> i32:
+    if PlatformHost.is_directory(path) == 1:
+        return 1
+    parent: str = PathOps.get_directory(path)
+    if Memory.strlen(parent) > 0 and Str.equals(parent, path) == false and PlatformHost.is_directory(parent) == 0:
+        if dopm_ensure_directory(parent) == 0:
+            return 0
+    return PlatformHost.create_directory(path)
+
+fun dopm_remove_tree(path: str) -> i32:
+    if PathOps.exists(path) == 0:
+        return 1
+    if PlatformHost.is_link(path) == 1:
+        return PlatformHost.remove_link(path)
+    if PlatformHost.is_directory(path) == 0:
+        return PlatformHost.remove_file(path)
+    names: list<str> = Dir.list(path)
+    index: i64 = 0
+    while index < names.size():
+        child: str = PathOps.join_path(path, names.get_str(index))
+        if dopm_remove_tree(child) == 0:
+            return 0
+        index = index + 1
+    return PlatformHost.remove_directory(path)
+
+fun dopm_line_record(line: str) -> DopmRecord:
+    record: DopmRecord = DopmRecord()
+    clean: str = Str.trim(line)
+    if Memory.strlen(clean) == 0 or Str.starts_with(clean, "#"):
+        return record
+    first: i64 = Str.index_of(clean, "|")
+    if first <= 0:
+        return record
+    remainder: str = Str.substring(clean, first + 1, Memory.strlen(clean))
+    second_relative: i64 = Str.index_of(remainder, "|")
+    record.name = Str.trim(Str.substring(clean, 0, first))
+    if second_relative < 0:
+        record.source = Str.trim(remainder)
+        record.revision = "*"
     else:
-        pm.install(pkg)
-else if str_eq(cmd, "remove"):
-    if Memory.strlen(pkg) == 0:
-        print("[ERROR] Usage: dopm remove <package>")
-    else:
-        pm.uninstall(pkg)
-else if str_eq(cmd, "list"):
-    pm.show_list()
-else if str_eq(cmd, "search"):
-    pm.search()
-else if str_eq(cmd, "help"):
-    pm.show_help()
-else:
-    print(@"[ERROR] Unknown command: {cmd}")
-    pm.show_help()
+        record.source = Str.trim(Str.substring(remainder, 0, second_relative))
+        record.revision = Str.trim(Str.substring(remainder, second_relative + 1, Memory.strlen(remainder)))
+    if dopm_safe_name(record.name) == 1 and dopm_safe_source(record.source) == 1:
+        if Memory.strlen(record.revision) == 0:
+            record.revision = "*"
+        if Str.equals(record.revision, "*") or dopm_safe_revision(record.revision) == 1:
+            record.valid = 1
+    return record
+
+fun dopm_record_from_text(content: str, wanted: str) -> DopmRecord:
+    start: i64 = 0
+    cursor: i64 = 0
+    length: i64 = Memory.strlen(content)
+    while cursor <= length:
+        at_end: bool = cursor == length
+        ch: i32 = 0
+        if not at_end:
+            ch = Memory.read_i8((content as i64) + cursor) as i32
+        if at_end or ch == 10:
+            line: str = Str.substring(content, start, cursor)
+            record: DopmRecord = dopm_line_record(line)
+            if record.valid == 1 and Str.equals(record.name, wanted):
+                return record
+            start = cursor + 1
+        cursor = cursor + 1
+    return DopmRecord()
+
+fun dopm_lock_is_valid() -> i32:
+    path: str = PathOps.join_path(PathOps.get_cwd(), "dopm.lock")
+    if PathOps.exists(path) == 0:
+        return 1
+    content: str = dopm_read(path)
+    start: i64 = 0
+    cursor: i64 = 0
+    length: i64 = Memory.strlen(content)
+    seen: str = "|"
+    while cursor <= length:
+        at_end: bool = cursor == length
+        ch: i32 = 0
+        if not at_end:
+            ch = Memory.read_i8((content as i64) + cursor) as i32
+        if at_end or ch == 10:
+            line: str = Str.trim(Str.substring(content, start, cursor))
+            if Memory.strlen(line) > 0 and Str.starts_with(line, "#") == false:
+                record: DopmRecord = dopm_line_record(line)
+                if record.valid == 0:
+                    return 0
+                marker: str = Str.concat("|", Str.concat(record.name, "|"))
+                if Str.contains(seen, marker):
+                    return 0
+                seen = Str.concat(seen, Str.concat(record.name, "|"))
+            start = cursor + 1
+        cursor = cursor + 1
+    return 1
+
+fun dopm_registry_path() -> str:
+    beside_executable: str = PathOps.join_path(PathOps.get_exe_directory(), "packages.txt")
+    if PathOps.exists(beside_executable) == 1:
+        return beside_executable
+    local: str = PathOps.join_path(PathOps.get_cwd(), "packages.txt")
+    if PathOps.exists(local) == 1:
+        return local
+    return ""
+
+fun dopm_registry_record(name: str) -> DopmRecord:
+    path: str = dopm_registry_path()
+    if Memory.strlen(path) == 0:
+        return DopmRecord()
+    return dopm_record_from_text(dopm_read(path), name)
+
+fun dopm_lock_record(name: str) -> DopmRecord:
+    return dopm_record_from_text(dopm_read(PathOps.join_path(PathOps.get_cwd(), "dopm.lock")), name)
+
+fun dopm_replace_lock(record: DopmRecord) -> i32:
+    if record.valid == 0 or dopm_safe_name(record.name) == 0 or dopm_safe_source(record.source) == 0 or dopm_safe_revision(record.revision) == 0:
+        return 0
+    if dopm_lock_is_valid() == 0:
+        return 0
+    path: str = PathOps.join_path(PathOps.get_cwd(), "dopm.lock")
+    content: str = dopm_read(path)
+    output: str = "# DOPM lock v1 - generated; do not edit by hand\n"
+    start: i64 = 0
+    cursor: i64 = 0
+    length: i64 = Memory.strlen(content)
+    while cursor <= length:
+        at_end: bool = cursor == length
+        ch: i32 = 0
+        if not at_end:
+            ch = Memory.read_i8((content as i64) + cursor) as i32
+        if at_end or ch == 10:
+            line: str = Str.trim(Str.substring(content, start, cursor))
+            existing: DopmRecord = dopm_line_record(line)
+            if existing.valid == 1 and Str.equals(existing.name, record.name) == false:
+                output = Str.concat(output, Str.concat(existing.name, Str.concat("|", Str.concat(existing.source, Str.concat("|", Str.concat(existing.revision, "\n"))))))
+            start = cursor + 1
+        cursor = cursor + 1
+    output = Str.concat(output, Str.concat(record.name, Str.concat("|", Str.concat(record.source, Str.concat("|", Str.concat(record.revision, "\n"))))))
+    temporary: str = Str.concat(path, ".tmp")
+    if dopm_write(temporary, output) == 0:
+        return 0
+    if PlatformHost.move_path(temporary, path) == 0:
+        PlatformHost.remove_file(temporary)
+        return 0
+    return 1
+
+fun dopm_remove_lock(name: str) -> i32:
+    if dopm_lock_is_valid() == 0:
+        return 0
+    path: str = PathOps.join_path(PathOps.get_cwd(), "dopm.lock")
+    content: str = dopm_read(path)
+    if Memory.strlen(content) == 0:
+        return 1
+    output: str = "# DOPM lock v1 - generated; do not edit by hand\n"
+    start: i64 = 0
+    cursor: i64 = 0
+    length: i64 = Memory.strlen(content)
+    while cursor <= length:
+        at_end: bool = cursor == length
+        ch: i32 = 0
+        if not at_end:
+            ch = Memory.read_i8((content as i64) + cursor) as i32
+        if at_end or ch == 10:
+            existing: DopmRecord = dopm_line_record(Str.substring(content, start, cursor))
+            if existing.valid == 1 and Str.equals(existing.name, name) == false:
+                output = Str.concat(output, Str.concat(existing.name, Str.concat("|", Str.concat(existing.source, Str.concat("|", Str.concat(existing.revision, "\n"))))))
+            start = cursor + 1
+        cursor = cursor + 1
+    temporary: str = Str.concat(path, ".tmp")
+    if dopm_write(temporary, output) == 0:
+        return 0
+    if PlatformHost.move_path(temporary, path) == 0:
+        PlatformHost.remove_file(temporary)
+        return 0
+    return 1
+
+fun dopm_git_revision(path: str, revision: str) -> str:
+    if dopm_safe_revision(revision) == 0:
+        return ""
+    commit_selector: str = Str.concat(revision, "^{commit}")
+    command: str = Str.concat("git -C ", Str.concat(dopm_quote(path), " rev-parse --verify "))
+    command = Str.concat(command, dopm_quote(commit_selector))
+    result: Output = Process.run_output(command)
+    if result.code == 0:
+        return Str.trim(result.stdout)
+    # A freshly cloned repository stores non-default branches as origin/*.
+    # Resolve that spelling explicitly instead of relying on checkout DWIM.
+    if Str.equals(revision, "HEAD") == false and Str.starts_with(revision, "origin/") == false:
+        remote_selector: str = Str.concat("origin/", commit_selector)
+        command = Str.concat("git -C ", Str.concat(dopm_quote(path), " rev-parse --verify "))
+        command = Str.concat(command, dopm_quote(remote_selector))
+        result = Process.run_output(command)
+        if result.code == 0:
+            return Str.trim(result.stdout)
+    return ""
+
+fun dopm_git_tree_is_clean(path: str) -> i32:
+    command: str = Str.concat("git -C ", Str.concat(dopm_quote(path), " status --porcelain --untracked-files=all"))
+    result: Output = Process.run_output(command)
+    if result.code != 0:
+        return 0
+    if Memory.strlen(Str.trim(result.stdout)) != 0:
+        return 0
+    return 1
+
+fun dopm_packages_root() -> str:
+    return PathOps.join_path(PathOps.join_path(PathOps.get_cwd(), ".dopm"), "packages")
+
+fun dopm_recover_removal(name: str) -> i32:
+    target: str = PathOps.join_path(dopm_packages_root(), name)
+    removing: str = Str.concat(target, ".removing")
+    if PathOps.exists(removing) == 0:
+        return 1
+    locked: DopmRecord = dopm_lock_record(name)
+    if locked.valid == 1:
+        # The lock still names the package, so publication of the removal was
+        # interrupted before commit. Restore the old tree.
+        if PathOps.exists(target) == 0:
+            return PlatformHost.move_path(removing, target)
+        return dopm_remove_tree(removing)
+    # The lock no longer names it: removal committed and only cleanup remained.
+    return dopm_remove_tree(removing)
+
+fun dopm_install_unlocked(name: str, requested: str) -> i32:
+    if dopm_safe_name(name) == 0:
+        print(@"dopm: invalid package name: {name}")
+        return 1
+    if dopm_lock_is_valid() == 0:
+        print("dopm: dopm.lock is malformed or contains duplicate packages")
+        return 1
+    if dopm_recover_removal(name) == 0:
+        print("dopm: could not recover an interrupted package removal")
+        return 1
+    locked: DopmRecord = dopm_lock_record(name)
+    selected: DopmRecord = locked
+    if selected.valid == 0:
+        selected = dopm_registry_record(name)
+    if Memory.strlen(requested) > 0 and Str.equals(requested, "*") == false:
+        # A URL/path overrides the registry source; other values are revisions.
+        if dopm_is_source_spec(requested):
+            selected.name = name
+            selected.source = requested
+            selected.revision = "*"
+            selected.valid = 1
+        elif selected.valid == 1:
+            selected.revision = requested
+    if selected.valid == 0:
+        print(@"dopm: package '{name}' is not in packages.txt and no source was provided")
+        return 1
+    if dopm_safe_source(selected.source) == 0:
+        print("dopm: package source contains an invalid lock-file delimiter")
+        return 1
+    if Str.equals(selected.revision, "*") == false and dopm_safe_revision(selected.revision) == 0:
+        print("dopm: invalid package revision")
+        return 1
+    root: str = dopm_packages_root()
+    if dopm_ensure_directory(root) == 0:
+        print(@"dopm: could not create {root}")
+        return 1
+    target: str = PathOps.join_path(root, name)
+    temporary: str = Str.concat(target, ".tmp")
+    backup: str = Str.concat(target, ".previous")
+    # Recover a transaction interrupted after moving the old package aside.
+    if PathOps.exists(backup) == 1:
+        if PathOps.exists(target) == 0:
+            if PlatformHost.move_path(backup, target) == 0:
+                print("dopm: could not recover the previous package version")
+                return 1
+        else:
+            current_revision: str = dopm_git_revision(target, "HEAD")
+            backup_revision: str = dopm_git_revision(backup, "HEAD")
+            transaction_committed: bool = locked.valid == 1 and Str.equals(current_revision, locked.revision)
+            if transaction_committed:
+                if dopm_remove_tree(backup) == 0:
+                    print("dopm: could not clean a completed package transaction")
+                    return 1
+            else:
+                # dopm.lock is the commit record. If it was not updated, the
+                # published replacement was never committed: restore the exact
+                # pre-transaction tree without requiring network access.
+                if locked.valid == 1 and Str.equals(backup_revision, locked.revision) == false:
+                    print("dopm: rollback package does not match dopm.lock")
+                    return 1
+                if dopm_remove_tree(target) == 0 or PlatformHost.move_path(backup, target) == 0:
+                    print("dopm: could not roll back an interrupted installation")
+                    return 1
+    if PlatformHost.is_directory(target) == 1:
+        installed_revision: str = dopm_git_revision(target, "HEAD")
+        expected_revision: str = ""
+        if locked.valid == 1 and Str.equals(selected.source, locked.source):
+            expected_revision = locked.revision
+        if Memory.strlen(requested) > 0 and Str.equals(requested, "*") == false:
+            if not dopm_is_source_spec(requested):
+                expected_revision = dopm_git_revision(target, requested)
+        if Memory.strlen(installed_revision) > 0 and Memory.strlen(expected_revision) > 0 and Str.equals(installed_revision, expected_revision) and dopm_git_tree_is_clean(target) == 1:
+            selected.revision = installed_revision
+            if dopm_replace_lock(selected) == 0:
+                print("dopm: installed package is valid but dopm.lock could not be updated")
+                return 1
+            print(@"[dopm] {name} is locked and installed at {installed_revision}")
+            return 0
+        # Keep the verified old package available while its replacement is
+        # fetched. Publication below swaps it only after clone+checkout pass.
+    dopm_remove_tree(temporary)
+    # Keep tags and remote refs available so a manifest may select a tag,
+    # branch, or commit; dopm.lock still records the immutable commit hash.
+    command: str = Str.concat("git clone -- ", Str.concat(dopm_quote(selected.source), Str.concat(" ", dopm_quote(temporary))))
+    print(@"[dopm] fetching {name}")
+    if Process.run(command) != 0:
+        dopm_remove_tree(temporary)
+        print(@"dopm: failed to fetch {selected.source}")
+        return 1
+    if Memory.strlen(selected.revision) > 0 and Str.equals(selected.revision, "*") == false:
+        requested_commit: str = dopm_git_revision(temporary, selected.revision)
+        if Memory.strlen(requested_commit) == 0:
+            dopm_remove_tree(temporary)
+            print(@"dopm: revision not found: {selected.revision}")
+            return 1
+        checkout: str = Str.concat("git -C ", Str.concat(dopm_quote(temporary), Str.concat(" checkout --detach ", dopm_quote(requested_commit))))
+        if Process.run(checkout) != 0:
+            dopm_remove_tree(temporary)
+            print(@"dopm: revision not found: {selected.revision}")
+            return 1
+    revision_command: str = Str.concat("git -C ", Str.concat(dopm_quote(temporary), " rev-parse HEAD"))
+    revision_output: Output = Process.run_output(revision_command)
+    if revision_output.code != 0 or Memory.strlen(revision_output.stdout) == 0:
+        dopm_remove_tree(temporary)
+        print("dopm: could not resolve the installed commit")
+        return 1
+    selected.revision = Str.trim(revision_output.stdout)
+    had_previous: i32 = 0
+    if PathOps.exists(target) == 1:
+        if dopm_remove_tree(backup) == 0:
+            dopm_remove_tree(temporary)
+            print("dopm: could not prepare the package rollback slot")
+            return 1
+        if PlatformHost.move_path(target, backup) == 0:
+            dopm_remove_tree(temporary)
+            print("dopm: could not preserve the previous package version")
+            return 1
+        had_previous = 1
+    if PlatformHost.move_path(temporary, target) == 0:
+        dopm_remove_tree(temporary)
+        if had_previous == 1:
+            PlatformHost.move_path(backup, target)
+        print("dopm: could not atomically publish the package")
+        return 1
+    if dopm_replace_lock(selected) == 0:
+        dopm_remove_tree(target)
+        if had_previous == 1:
+            PlatformHost.move_path(backup, target)
+        print("dopm: could not update dopm.lock; installation rolled back")
+        return 1
+    if had_previous == 1:
+        if dopm_remove_tree(backup) == 0:
+            print("dopm: package installed, but the previous version could not be cleaned")
+            return 1
+    print(@"[dopm] installed {name} at {selected.revision}")
+    return 0
+
+fun dopm_remove_unlocked(name: str) -> i32:
+    if dopm_safe_name(name) == 0:
+        return 1
+    if dopm_lock_is_valid() == 0:
+        print("dopm: dopm.lock is malformed or contains duplicate packages")
+        return 1
+    if dopm_recover_removal(name) == 0:
+        print("dopm: could not recover an interrupted package removal")
+        return 1
+    target: str = PathOps.join_path(dopm_packages_root(), name)
+    if PathOps.exists(target) == 0:
+        if dopm_remove_lock(name) == 0:
+            return 1
+        print(@"[dopm] {name} is already absent")
+        return 0
+    removing: str = Str.concat(target, ".removing")
+    if dopm_remove_tree(removing) == 0:
+        print("dopm: could not prepare the package removal transaction")
+        return 1
+    if PlatformHost.move_path(target, removing) == 0:
+        print(@"dopm: could not stage removal of {target}")
+        return 1
+    if dopm_remove_lock(name) == 0:
+        PlatformHost.move_path(removing, target)
+        print("dopm: dopm.lock could not be updated; removal rolled back")
+        return 1
+    if dopm_remove_tree(removing) == 0:
+        print("dopm: removal committed, but its rollback tree could not be cleaned")
+        return 1
+    print(@"[dopm] removed {name}")
+    return 0
+
+fun dopm_lock_path() -> str:
+    state_root: str = PathOps.join_path(PathOps.get_cwd(), ".dopm")
+    if dopm_ensure_directory(state_root) == 0:
+        return ""
+    return PathOps.join_path(state_root, "project.lock")
+
+fun dopm_install(name: str, requested: str) -> i32:
+    lock_path: str = dopm_lock_path()
+    if Memory.strlen(lock_path) == 0:
+        print("dopm: could not create the project state directory")
+        return 1
+    lock: i64 = PlatformHost.acquire_process_lock(lock_path)
+    if lock == 0:
+        print("dopm: could not acquire the project package lock")
+        return 1
+    result: i32 = dopm_install_unlocked(name, requested)
+    PlatformHost.release_process_lock(lock)
+    return result
+
+fun dopm_remove(name: str) -> i32:
+    lock_path: str = dopm_lock_path()
+    if Memory.strlen(lock_path) == 0:
+        return 1
+    lock: i64 = PlatformHost.acquire_process_lock(lock_path)
+    if lock == 0:
+        print("dopm: could not acquire the project package lock")
+        return 1
+    result: i32 = dopm_remove_unlocked(name)
+    PlatformHost.release_process_lock(lock)
+    return result
+
+fun dopm_list() -> i32:
+    root: str = dopm_packages_root()
+    names: list<str> = Dir.list(root)
+    if names.size() == 0:
+        print("No project packages are installed.")
+        return 0
+    index: i64 = 0
+    while index < names.size():
+        name: str = names.get_str(index)
+        if PlatformHost.is_directory(PathOps.join_path(root, name)) == 1:
+            print(name)
+        index = index + 1
+    return 0
+
+fun dopm_search() -> i32:
+    path: str = dopm_registry_path()
+    if Memory.strlen(path) == 0:
+        print("dopm: packages.txt was not found")
+        return 1
+    print(dopm_read(path))
+    return 0
+
+fun dopm_help():
+    print(dopm_version())
+    print("Usage:")
+    print("  dopm install <name> [source-or-revision]")
+    print("  dopm remove <name>")
+    print("  dopm list")
+    print("  dopm search")
+    print("  dopm --version")
+    print("")
+    print("Packages are isolated in .dopm/packages and exact Git commits are stored in dopm.lock.")
+
+fun dopm_main() -> i32:
+    command: str = Args.get(1)
+    if Memory.strlen(command) == 0 or Str.equals(command, "help") or Str.equals(command, "--help"):
+        dopm_help()
+        return 0
+    if Str.equals(command, "--version") or Str.equals(command, "version"):
+        print(dopm_version())
+        return 0
+    if Str.equals(command, "install"):
+        name: str = Args.get(2)
+        if Memory.strlen(name) == 0:
+            print("dopm: install requires a package name")
+            return 1
+        return dopm_install(name, Args.get(3))
+    if Str.equals(command, "remove") or Str.equals(command, "uninstall"):
+        name: str = Args.get(2)
+        if Memory.strlen(name) == 0:
+            print("dopm: remove requires a package name")
+            return 1
+        return dopm_remove(name)
+    if Str.equals(command, "list"):
+        return dopm_list()
+    if Str.equals(command, "search"):
+        return dopm_search()
+    print(@"dopm: unknown command: {command}")
+    dopm_help()
+    return 1
+
+Process.exit(dopm_main())

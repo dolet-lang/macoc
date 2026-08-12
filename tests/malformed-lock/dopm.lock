@@ -1,0 +1,4 @@
+# Deliberately invalid regression fixture: duplicate package identities must be
+# rejected before DOPM consults the registry or performs network I/O.
+image|https://example.invalid/one.git|0123456789012345678901234567890123456789
+image|https://example.invalid/two.git|abcdefabcdefabcdefabcdefabcdefabcdefabcd

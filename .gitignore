@@ -1,0 +1,8 @@
+build/
+dopm.exe
+dopm
+*.mlir
+*.ll
+*.obj
+*.o
+.dopm/

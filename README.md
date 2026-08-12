@@ -1,188 +1,88 @@
-# dopm
-### Official Package Manager for Dolet
+# DOPM
 
-`dopm` هو مدير الحزم الرسمي لمشاريع **Dolet**.
-مصمم ليكون خفيفًا، سريعًا، ومكتوب بالكامل بلغة **Pure Dolet** بدون أي اعتماد خارجي.
+DOPM is the deterministic package acquisition and lock tool for Dolet projects.
+It is written in Dolet and keeps every project's dependencies isolated from the
+compiler installation.
 
-> ⚡ Native. Fast. Minimal.
-> Built for the Dolet ecosystem.
+## Responsibilities
 
----
+- DOPM downloads packages into `.dopm/packages`.
+- `dopm.lock` records the exact Git commit used by each package.
+- Obin reads a project's manifest, asks DOPM to synchronize dependencies, then
+  invokes `doletc` with the project-local package root.
+- `doletc` compiles sources and links native package libraries. It does not
+  download packages or interpret an application manifest.
 
-## ✨ Features
+Git is an explicit acquisition boundary. DOPM itself uses Dolet's portable
+platform APIs for files, directories, environment variables, and process
+management.
 
-- 🚀 سرعة تنفيذ عالية
-- 📦 تثبيت وإزالة الحزم بسهولة
-- 🧩 إدارة الاعتماديات الخارجية
-- 🛠️ مكتوب بالكامل بـ Pure Dolet
-- 🔒 تصميم بسيط ومستقر
-- 🌍 يعمل على Linux و Windows
+Package names use the portable lowercase form `[a-z0-9_-]+`; this avoids a
+lock resolving to two different directory identities on case-sensitive and
+case-insensitive filesystems.
 
----
+## Commands
 
-## 📦 Installation
-
-### 1️⃣ Clone the repository
-
-```bash
-git clone https://github.com/dolet-lang/dopm.git
-cd dopm
+```text
+dopm install <name> [source-or-revision]
+dopm remove <name>
+dopm list
+dopm search
+dopm --version
 ```
 
----
+`source-or-revision` may be a Git URL, a local repository path, a branch, tag,
+or commit. Spell relative local paths with `./` or `../` (an already-existing
+path is also recognized); this keeps branch names such as `feature/rendering`
+unambiguous. The installed commit--not a floating branch name--is stored in the
+lock file. A pre-existing package directory is accepted only after its Git
+revision matches the lock/request and its complete tracked/untracked tree is
+clean. Stale or edited directories are replaced.
 
-### 2️⃣ Build
+Install/remove operations take a per-project interprocess lock. An update is
+cloned and checked out in a temporary directory, the old package is preserved
+as a rollback slot, and publication plus `dopm.lock` replacement are atomic.
+An interrupted transaction is recovered on the next invocation.
 
-#### باستخدام مترجم Dolet مباشرة
+The optional `packages.txt` registry uses this line format:
 
-```bash
-dolet main.dlt -o do.exe
+```text
+name|canonical-git-source|default-revision
 ```
 
-#### أو باستخدام سكربتات البناء
+## Building
 
-**Linux**
-```bash
-./linux_build.sh
-```
+Set `DOLETC` to a compiler path or put `doletc` on `PATH`, then run:
 
-**Windows**
-```bash
+```powershell
 .\windows_build.bat
 ```
 
----
+or:
 
-## ➕ Add dopm to PATH
-
-### 🐧 Linux / macOS
-
-أفضل طريقة:
-
-```bash
-sudo mv do /usr/local/bin/
+```sh
+./linux_build.sh
 ```
 
-أو أضف مساره يدويًا:
+The outputs are `build/dopm.exe` on Windows and `build/dopm` on Linux.
 
-```bash
-export PATH="$PATH:/path/to/dopm"
+## Project layout
+
+```text
+project/
+  dolet.toml
+  dopm.lock
+  .dopm/
+    packages/
+      package-name/
 ```
 
----
+Generated package directories and build outputs must not be committed. Commit
+`dopm.lock` so another machine resolves the same source revisions.
 
-### 🪟 Windows
+## Platform model
 
-1. افتح *Edit the system environment variables*
-2. اضغط **Environment Variables**
-3. عدّل متغير **Path**
-4. أضف مسار المجلد الذي يحتوي على `do.exe`
-5. اضغط OK
-
----
-
-## ⚡ Quick Start
-
-بعد الإعداد يمكنك استخدامه من أي مجلد:
-
-```bash
-do
-```
-
-تثبيت حزمة:
-
-```bash
-do install <package_name>
-```
-
-إزالة حزمة:
-
-```bash
-do remove <package_name>
-```
-
----
-
-## 📁 Project Structure
-
-```
-dopm/
- ├── main.dlt
- ├── linux_build.sh
- ├── windows_build.bat
- └── README.md
-```
-
----
-
-## 🧠 Design Philosophy
-
-`dopm` يتبع مبادئ Dolet:
-
-- أداء عالٍ بدون تعقيد
-- لا اعتماديات خارجية
-- وضوح في التنفيذ
-- تحكم كامل على مستوى النظام
-
-الهدف هو إبقاء مدير الحزم بسيطًا وسريعًا بدل تحويله إلى نظام ضخم ومعقد.
-
----
-
-## 🔮 Roadmap
-
-- [ ] دعم versioning متقدم
-- [ ] دعم dependency resolution
-- [ ] registry مركزي للحزم
-- [ ] lock file للنُسخ الثابتة
-- [ ] دعم مشاريع متعددة داخل workspace
-
----
-
-## 🤝 Contributing
-
-المساهمات مرحب بها.
-
-1. Fork المشروع
-2. أنشئ branch جديد
-3. أضف تعديلاتك
-4. افتح Pull Request
-
----
-
-## 📜 License
-
-MIT License
-Free to use, modify, and distribute.
-
----
-
-## 💬 About Dolet
-
-Dolet هي لغة برمجة عالية الأداء تركز على:
-
-- توليد Machine Code مباشر
-- أداء يشبه Rust
-- نظام أنواع صارم
-- تصميم minimal بدون overhead
-
-`dopm` هو جزء من منظومة أدوات Dolet الرسمية.
-
----
-
-# 🚀 Why dopm?
-
-لأن لغة قوية تحتاج مدير حزم بنفس القوة.
-
-
-## ⚠ Current Platform Support
-
-Currently, `dopm` runs only on **Windows** because it directly uses the Windows API.
-
-Cross-platform support is planned.  
-Future versions will introduce an abstraction layer using:
-
-- Windows API (Kernel32)
-- Linux syscalls
-- Other platform-specific implementations
-
-
+Windows uses the Win32 platform pack. Linux core operations use direct syscalls;
+desktop packages may separately require the native X11/Vulkan system ABI. That
+desktop boundary belongs to those packages/platform resources, not DOPM's
+package-resolution logic.

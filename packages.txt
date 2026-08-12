@@ -1,0 +1,5 @@
+# name | canonical Git source | default revision
+frog|https://github.com/xRo0t/frog-engine.git|main
+image|https://github.com/dolet-lang/image.git|main
+window|https://github.com/dolet-lang/window.git|main
+vulkan|https://github.com/xRo0t/dolet-vk-bindings-lib.git|main
